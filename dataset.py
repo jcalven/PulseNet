@@ -1,4 +1,5 @@
 import h5py
+import tensorflow as tf
 from collections import namedtuple
 
 class HDF5Generator:
@@ -6,29 +7,56 @@ class HDF5Generator:
     Generator for yielding HDF5 data entries.
     """
     
-    def __init__(self, key=None, fields=None):
+    def __init__(self, key=None, fields=None, index=None):
         """
         Args:
             key (str): HDF5 key
             fields (namedtuple): Named tuple of columns elements names to extract from HDF5 file
+            condition (dict, tuple, list): 1st element is index key, 2nd element is index (key/val if dict)
         """
-        
+        self.index = index
+        # Formatting checks
         if key is not None:
             if not isinstance(key, str):
                 raise ValueError('key <{}> must be str'.format(key))
             self.key = key
         if fields is not None:
             if not isinstance(fields, type):
-                raise ValueError('fields<{}> must be namedtuple'.format(fields))
+                raise ValueError('fields <{}> must be namedtuple'.format(fields))
             self.fields = fields
+        if index is not None:
+            if not isinstance(index, (dict, tuple, list)):
+                raise ValueError('index <{}> must be [dict, tuple, list]'.format(index))
+            #elif len(index) != 2:
+            #    raise ValueError('index <{}> must have size 2.'.format(index))
+            else:
+                if isinstance(index, dict):
+                    self.index_key = list(index.keys())[0]
+                    self.index_val = set(index[self.index_key])
+                else:
+                    self.index_key = index[0]
+                    self.index_val = set(index[1])
+                
+    def _in_index(self, entry):
+        if entry[self.index_key] in self.index_val:
+            return True
+        else:
+            return False
         
     def __call__(self, file):        
-        print('Processing file <{}>...\n'.format(file))
-            
+        #print('Processing file <{}>...\n'.format(file))   
         with h5py.File(file, 'r') as hf:
-            for entry in hf[self.key]:
-                # Generates tuple field in dict comprehension and yields fields data
-                yield self.fields(**{key: entry[key] for key in self.fields._fields})
+            if self.index is not None:
+                for entry in hf[self.key]:
+                    # Check if entry is in index
+                    if self._in_index(entry):
+                        # Generates tuple field in dict comprehension and yields fields data
+                        yield self.fields(**{key: entry[key] for key in self.fields._fields})
+            else:
+                for entry in hf[self.key]:
+                    # Generates tuple field in dict comprehension and yields fields data
+                    yield self.fields(**{key: entry[key] for key in self.fields._fields})
+                
 
 
 class PreProcess(object):
@@ -45,7 +73,8 @@ class PreProcess(object):
     generator_shapes = (tf.TensorShape([None]), tf.TensorShape([]))
     
     def __init__(self, cycle_length=2, read_option='hdf5', start_index=0, stop_index=90000,
-                 num_parallel_calls=2, buffer_size=100, repeat=1, batch=1, prefetch=1, **kwargs):
+                 num_parallel_calls=2, buffer_size=100, repeat=1, batch=1, prefetch=1, 
+                 index=None, **kwargs):
         
         """
         Args:
@@ -70,6 +99,7 @@ class PreProcess(object):
         self.repeat = repeat
         self.batch = batch
         self.prefetch = prefetch
+        self.index = index
     
     def _preprocess(self, *args):
         """
@@ -98,7 +128,7 @@ class PreProcess(object):
         Creates dataset from input files.
         """
         if self.read_option == 'hdf5':   
-            dataset = files.interleave(lambda filename: tf.data.Dataset.from_generator(HDF5Generator(key=self.key, fields=self.fields), 
+            dataset = files.interleave(lambda filename: tf.data.Dataset.from_generator(HDF5Generator(key=self.key, fields=self.fields, index=self.index), 
                                                                                        self.generator_datatypes, self.generator_shapes, 
                                                                                        args=(filename,)), cycle_length=self.cycle_length)
         elif self.read_option =='tfrecord':
@@ -117,11 +147,19 @@ class PreProcess(object):
             tf.Dataset: Preprocessed tf.Dataset object.
         """
         
+        #files = tf.data.Dataset.from_tensor_slices(files)
+        #dataset = self._generate(files)
+        #dataset = dataset.map(lambda *data: self._preprocess(*data), num_parallel_calls=self.num_parallel_calls)
+        #dataset = dataset.shuffle(buffer_size=self.buffer_size)
+        #dataset = dataset.repeat(self.repeat)
+        #dataset = dataset.batch(self.batch)
+        #dataset = dataset.prefetch(self.prefetch)
+        
+        # Supposedly faster than separate map and batch
         files = tf.data.Dataset.from_tensor_slices(files)
         dataset = self._generate(files)
-        dataset = dataset.map(lambda *data: self._preprocess(*data), num_parallel_calls=self.num_parallel_calls)
         dataset = dataset.shuffle(buffer_size=self.buffer_size)
-        dataset = dataset.repeat(self.repeat)
-        dataset = dataset.batch(self.batch)
+        dataset = dataset.apply(tf.data.experimental.map_and_batch(lambda *data: self._preprocess(*data), batch_size=self.batch, 
+                                                              num_parallel_calls=self.num_parallel_calls))
         dataset = dataset.prefetch(self.prefetch)
         return dataset

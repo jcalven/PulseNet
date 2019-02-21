@@ -14,7 +14,8 @@ class PulseNet:
     """
 
     def __init__(self, data_X, data_y, learning_rate=0.001, n_classes=2, hparams=None,
-                 run_dir='', experiment_name='default_experiment_name'):
+                 run_dir='', experiment_name='default_experiment_name', is_training=True,
+                 causal=True):
         """
         Creates model network on class init.
         Args:
@@ -25,6 +26,8 @@ class PulseNet:
             hparams (dict): Dictionary of hyper paramaters.
             run_dir (str): Directory to store model.
             experiment_name (str): Name of experiment.
+            is_training (bool): If training, True. 
+            causal (bool): If True, dilated conv layer will be causal (as per the WaveNet paper)
         """
     
         self.data_X = data_X
@@ -34,11 +37,19 @@ class PulseNet:
         self.hparams = hparams
         self.run_dir = run_dir
         self.experiment_name = experiment_name
+        self.is_training = is_training
+        self.causal = causal
         self._create_architecture(data_X, data_y, run_dir, experiment_name)
         
     def _create_architecture(self, data_X, data_y, run_dir, experiment_name):
 
         logits = self._create_model(data_X)
+        
+        # Average pooling layer (directly after the dilated conv layer, as per the WaveNet paper)
+        logits = self.average_pooling(logits, pool_size=self.hparams.pool_size, avg_pool_padding=self.hparams.avg_pool_padding)
+        
+        # Add here one or more conv_1x1_layer (as per the WaveNet paper)
+        logits = self.conv_1x1_layer(logits, logits.shape[-1].value)
         
         with tf.variable_scope("postprocess"):
             predictions = tf.keras.activations.relu(logits)     
@@ -47,6 +58,9 @@ class PulseNet:
                 output_size=predictions.shape[-1].value,
                 activation="relu",
             )
+              
+        # Batch norm
+        predictions = tf.keras.layers.BatchNormalization()(predictions, training=self.is_training)
             
         predictions = tf.layers.flatten(predictions) 
         predictions = tf.keras.layers.Dense(self.n_classes, activation="softmax")(predictions)   
@@ -54,7 +68,7 @@ class PulseNet:
         # Assign class variable for predicted labels for easy retrieval
         self.y_predict = predictions
         
-        # 
+        # Use softmax cross entropy since labels are one hot encoded
         self.loss = tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits_v2(labels = data_y, logits = predictions))
         self.optimizer = tf.train.AdamOptimizer(learning_rate = self.learning_rate).minimize(self.loss)
         
@@ -126,10 +140,15 @@ class PulseNet:
         Returns:
             tf.Tensor: Resulting tensor after applying the convolution.
         """
+        if self.causal:
+            padding = 'causal'
+        else:
+            padding = 'same'
+        
         causal_conv_op = tf.keras.layers.Conv1D(
             output_size,
             kernel_width,
-            padding="causal",
+            padding=padding,
             dilation_rate=dilation_rate,
             name="causal_conv",
         )
@@ -149,17 +168,15 @@ class PulseNet:
         )
         return conv_1x1_op(x)
     
-    #TODO Implement average pooling layer.
-    def average_pooling(self):
+    def average_pooling(self, x, pool_size=2, avg_pool_padding='same'):
         """Applies a 1D average pooling operation to the input.
         Args:
             x (tf.Tensor): Input tensor.
         Returns:
             tf.Tensor: Resulting tensor after applying average pooling.
         """
-        # avg_pool = tf.keras.layers.AveragePooling1D()
-        # return avg_pool
-        pass
+        avg_pool = tf.keras.layers.AveragePooling1D(pool_size=pool_size, padding=avg_pool_padding)
+        return avg_pool(x)
 
     def gated_residual_layer(self, x, dilation_rate):
         """Creates a gated, dilated convolutional layer with a residual connnection.
@@ -174,24 +191,12 @@ class PulseNet:
             x_filter_conv = self.causal_conv_layer(
                 x, x.shape[-1].value, self.hparams.dilation_kernel_width, dilation_rate
             )
-
-            # TODO: Add here a average pooling layer (after the dilated conv layer, as per the WaveNet paper)
-            # x_filter_conv = self.average_pooling(x_filter_conv, )
-            
-            # TODO: Add here one or more self.conv_1x1_layer
-
         with tf.variable_scope("gate"):
             x_gate_conv = self.causal_conv_layer(
                 x, x.shape[-1].value, self.hparams.dilation_kernel_width, dilation_rate
             )
-
-            # TODO: Add here a average pooling layer (after the dilated conv layer, as per the WaveNet paper)
-            # x_gate_conv = self.average_pooling(x_gate_conv, )
             
-            # TODO: Add here one or more self.conv_1x1_layer
-            
-        gated_activation = tf.tanh(x_filter_conv) * tf.sigmoid(
-            x_gate_conv)
+        gated_activation = tf.tanh(x_filter_conv) * tf.sigmoid(x_gate_conv)
 
         with tf.variable_scope("residual"):
             residual = self.conv_1x1_layer(gated_activation, x.shape[-1].value)
@@ -199,5 +204,4 @@ class PulseNet:
             skip_connection = self.conv_1x1_layer(
                 gated_activation, self.hparams.skip_output_dim
             )
-
         return skip_connection, x + residual
